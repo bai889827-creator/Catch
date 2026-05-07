@@ -463,39 +463,194 @@
         const height = canvas.height;
         const imageData = ctx.getImageData(0, 0, width, height).data;
 
-        // 获取中心线像素变化的辅助函数
-        function countTransitions(isVertical) {
-            const limit = isVertical ? height : width;
-            const center = isVertical ? Math.floor(width / 2) : Math.floor(height / 2);
-            let transitions = 0;
-            let lastColor = "";
-            let segments = 0;
+        const rowResult = detectAxisCells(false);
+        const colResult = detectAxisCells(true);
+        const rowsInput = document.getElementById('rows');
+        const colsInput = document.getElementById('cols');
+        const detectedRows = rowResult.cells || parseInt(rowsInput.value) || 10;
+        const colChoice = chooseColumnCount(detectedRows, colResult, parseInt(colsInput.value) || 10);
 
-            for (let i = 0; i < limit; i++) {
-                const idx = isVertical ? (i * width + center) * 4 : (center * width + i) * 4;
-                const r = imageData[idx], g = imageData[idx+1], b = imageData[idx+2];
-                const color = `${Math.floor(r/10)},${Math.floor(g/10)},${Math.floor(b/10)}`; // 模糊匹配避免噪点
+        rowsInput.value = detectedRows;
+        colsInput.value = colChoice.cells;
 
-                if (color !== lastColor) {
-                    // 如果颜色发生显著变化（跳过背景白色/浅灰）
-                    if (r < 245 || g < 245 || b < 245) {
-                        segments++;
-                    }
-                    lastColor = color;
-                }
+        const confidence = Math.round(Math.min(rowResult.confidence, colChoice.confidence) * 100);
+        const confidenceText = confidence >= 70 ? "可信度较高" : "请重点核对";
+        document.getElementById('status').innerText =
+            `已自动识别为 ${detectedRows} 行 x ${colChoice.cells} 列（${confidenceText}，${confidence}%）。如不准确可手动修改。`;
+
+        function chooseColumnCount(rows, detectedByLines, fallbackCols) {
+            const squareCellCols = Math.max(1, Math.round(width / (height / rows)));
+            const lineCols = detectedByLines.cells;
+            const lineConfidence = detectedByLines.confidence;
+            const lineMatchesRatio = lineCols && Math.abs(lineCols - squareCellCols) <= 1;
+
+            if (lineCols && lineConfidence >= 0.72 && lineMatchesRatio) {
+                return {
+                    cells: lineCols,
+                    confidence: lineConfidence
+                };
             }
-            // 简单的启发式算法：每个格子通常对应两个大的颜色跳变点（进入和离开）
-            // 在这种游戏截图中，直接统计颜色段落通常很有效
-            return Math.round(segments / 2.1); // 2.1 是经验系数，过滤细微边框
+
+            return {
+                cells: squareCellCols || lineCols || fallbackCols,
+                confidence: lineCols ? Math.max(0.62, Math.min(0.88, lineConfidence)) : 0.68
+            };
         }
 
-        // 尝试推测行列（这只是一个初步估算，取决于截图质量）
-        // 实际上这类游戏格子非常规范，我们可以通过寻找主要颜色块来确定
-        // 为保证准确性，这里我们提供推测值，但允许用户修改
-        const detectedRows = 10; // 默认值，自动检测逻辑在高动态背景下较复杂
-        const detectedCols = 10;
+        function detectAxisCells(isVerticalLine) {
+            const axisLength = isVerticalLine ? width : height;
+            const crossLength = isVerticalLine ? height : width;
+            const scores = buildLineScores(isVerticalLine, axisLength, crossLength);
+            const stats = getStats(scores.slice(1, -1));
+            const threshold = stats.mean + stats.stdev * 0.85;
+            const peaks = findPeakGroups(scores, threshold, axisLength);
+            const peakCount = peaks.length;
+            const maxCells = Math.min(30, Math.max(2, Math.floor(axisLength / 8)));
+            let best = { cells: 0, score: 0 };
 
-        document.getElementById('status').innerText = "系统已尝试匹配网格，请核对行列数。";
+            for (let cells = 2; cells <= maxCells; cells++) {
+                const internalLines = cells - 1;
+                const tolerance = Math.max(2, Math.round((axisLength / cells) * 0.18));
+                let matchedLines = 0;
+                let totalStrength = 0;
+
+                for (let line = 1; line < cells; line++) {
+                    const expected = Math.round(axisLength * line / cells);
+                    const localScore = getMaxAround(scores, expected, tolerance);
+                    const normalized = (localScore - stats.mean) / stats.stdev;
+
+                    if (localScore >= threshold) matchedLines++;
+                    totalStrength += Math.max(0, normalized);
+                }
+
+                const matchRatio = matchedLines / internalLines;
+                const strengthScore = Math.min(1, (totalStrength / internalLines) / 3);
+                const countScore = peakCount
+                    ? 1 - Math.min(1, Math.abs(internalLines - peakCount) / Math.max(internalLines, peakCount))
+                    : 0;
+                const score = matchRatio * 0.5 + strengthScore * 0.3 + countScore * 0.2;
+
+                if (score > best.score) {
+                    best = { cells, score };
+                }
+            }
+
+            return {
+                cells: best.score >= 0.36 ? best.cells : 0,
+                confidence: Math.max(0, Math.min(1, best.score))
+            };
+        }
+
+        function buildLineScores(isVerticalLine, axisLength, crossLength) {
+            const scores = new Array(axisLength).fill(0);
+            const crossStep = Math.max(1, Math.floor(crossLength / 90));
+
+            for (let axis = 1; axis < axisLength - 1; axis++) {
+                let total = 0;
+                let samples = 0;
+
+                for (let cross = Math.floor(crossStep / 2); cross < crossLength; cross += crossStep) {
+                    const prev = getPixel(isVerticalLine, axis - 1, cross);
+                    const next = getPixel(isVerticalLine, axis + 1, cross);
+                    const current = getPixel(isVerticalLine, axis, cross);
+                    const edge = pixelDistance(prev, next);
+                    const darkLine = Math.max(0, (150 - getLuma(current)) / 150) * 70;
+
+                    total += edge + darkLine;
+                    samples++;
+                }
+
+                scores[axis] = total / samples;
+            }
+
+            return smoothScores(scores);
+        }
+
+        function getPixel(isVerticalLine, axis, cross) {
+            const x = isVerticalLine ? axis : cross;
+            const y = isVerticalLine ? cross : axis;
+            const idx = (y * width + x) * 4;
+
+            return [imageData[idx], imageData[idx + 1], imageData[idx + 2]];
+        }
+
+        function getLuma(pixel) {
+            return pixel[0] * 0.299 + pixel[1] * 0.587 + pixel[2] * 0.114;
+        }
+
+        function pixelDistance(a, b) {
+            return Math.sqrt(
+                Math.pow(a[0] - b[0], 2) +
+                Math.pow(a[1] - b[1], 2) +
+                Math.pow(a[2] - b[2], 2)
+            );
+        }
+
+        function smoothScores(scores) {
+            return scores.map((score, index) => {
+                let total = 0;
+                let count = 0;
+
+                for (let offset = -2; offset <= 2; offset++) {
+                    const value = scores[index + offset];
+                    if (value !== undefined) {
+                        total += value;
+                        count++;
+                    }
+                }
+
+                return total / count;
+            });
+        }
+
+        function getStats(values) {
+            const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+            const variance = values.reduce((sum, value) => sum + Math.pow(value - mean, 2), 0) / values.length;
+
+            return {
+                mean,
+                stdev: Math.max(1, Math.sqrt(variance))
+            };
+        }
+
+        function findPeakGroups(scores, threshold, axisLength) {
+            const peaks = [];
+            let active = null;
+            const edgePadding = Math.max(2, Math.round(axisLength * 0.015));
+
+            for (let i = edgePadding; i < scores.length - edgePadding; i++) {
+                if (scores[i] >= threshold) {
+                    if (!active) {
+                        active = { start: i, end: i, max: scores[i], maxIndex: i };
+                    } else {
+                        active.end = i;
+                        if (scores[i] > active.max) {
+                            active.max = scores[i];
+                            active.maxIndex = i;
+                        }
+                    }
+                } else if (active) {
+                    peaks.push(active);
+                    active = null;
+                }
+            }
+
+            if (active) peaks.push(active);
+
+            return peaks.filter(peak => peak.end - peak.start <= Math.max(8, axisLength * 0.08));
+        }
+
+        function getMaxAround(scores, center, radius) {
+            const start = Math.max(0, center - radius);
+            const end = Math.min(scores.length - 1, center + radius);
+            let max = 0;
+
+            for (let i = start; i <= end; i++) {
+                if (scores[i] > max) max = scores[i];
+            }
+
+            return max;
+        }
     }
 
     async function autoDetectAndSolve() {
